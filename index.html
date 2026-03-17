@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Mirage Lock — Tap &amp; Freeze Gem Catcher Game</title>
+  <meta name="description" content="Tap to freeze shimmering mirage zones and collect orbiting gems before they escape. Free hyper-casual game — no download, no install.">
+  <meta name="keywords" content="hyper casual game, tap game, free browser game, html5 game, mirage lock, gem collector">
+  <meta property="og:title" content="Mirage Lock — Tap. Freeze. Collect.">
+  <meta property="og:description" content="Gems orbit the center. Mirage zones drift across them. Tap at peak overlap to freeze the zone and lock the gem. One mechanic. Infinite depth.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://balinti.github.io/mirage-lock/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Mirage Lock — can you catch 50 gems?">
+  <meta name="twitter:description" content="Free tap game. Freeze the mirage at the right moment. Zero installs.">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4099346100621490" crossorigin="anonymous"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a14;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      overflow: hidden;
+      touch-action: none;
+    }
+    #gameWrapper {
+      position: relative;
+      width: min(420px, 100vw);
+      height: min(750px, 100vh);
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+<div id="gameWrapper">
+  <canvas id="c"></canvas>
+</div>
+<script>
+(function(){
+'use strict';
+
+// --- CANVAS SETUP ---
+const wrapper = document.getElementById('gameWrapper');
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, DPR;
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = wrapper.clientWidth;
+  H = wrapper.clientHeight;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+resize();
+window.addEventListener('resize', () => { resize(); });
+
+// --- STORAGE ---
+const STORE_KEY = 'mirageLock_allTimeBest';
+const DAILY_KEY = 'mirageLock_dailyBest';
+const SESSION_KEY = 'mirageLock_sessionCount';
+function getBest() { return parseInt(localStorage.getItem(STORE_KEY) || '0'); }
+function saveBest(s) { if (s > getBest()) localStorage.setItem(STORE_KEY, s); }
+function getDailyBest() { return parseInt(localStorage.getItem(DAILY_KEY) || '0'); }
+function saveDailyBest(s) { if (s > getDailyBest()) localStorage.setItem(DAILY_KEY, s); }
+function getSessionCount() { return parseInt(localStorage.getItem(SESSION_KEY) || '0'); }
+function incSessionCount() { localStorage.setItem(SESSION_KEY, getSessionCount() + 1); }
+
+// --- PARSE CHALLENGE TARGET ---
+const urlParams = new URLSearchParams(location.search);
+const CHALLENGE_TARGET = parseInt(urlParams.get('target') || '0');
+
+// --- GAME STATE ---
+const STATE = { START: 0, PLAYING: 1, GAMEOVER: 2 };
+let state = STATE.START;
+let score = 0;
+let lives = 3;
+let heatStreak = 0;
+let heatMode = false;
+let heatTimer = 0;
+let bgHue = 250;
+let shake = { x: 0, y: 0, frames: 0, mag: 0 };
+let particles = [];
+let floatTexts = [];
+let bgSpecs = [];
+let gems = [];
+let mirages = [];
+let retryHold = 0; // frames before PLAY AGAIN appears
+let autoRestartToggle = false;
+let sessionCount = 0;
+let milestoneFlash = { active: false, text: '', timer: 0 };
+let phantomMirage = null;
+let phantomFreezeTimer = 0; // >0 means all real mirages are dark
+
+// Milestone messages
+const MILESTONES = { 25: 'LOCKED IN', 50: 'SURGE', 75: 'PHANTOM ZONE', 100: 'MIRAGE MASTER' };
+let triggeredMilestones = new Set();
+
+// --- BACKGROUND SPECS ---
+function initBgSpecs() {
+  bgSpecs = [];
+  for (let i = 0; i < 35; i++) {
+    bgSpecs.push({
+      x: Math.random() * 420,
+      y: Math.random() * 750,
+      r: Math.random() * 1.5 + 0.3,
+      vy: Math.random() * 0.12 + 0.04,
+      alpha: Math.random() * 0.12 + 0.04,
+      hue: 180 + Math.random() * 60
+    });
+  }
+}
+initBgSpecs();
+
+// --- GEM ---
+function createGem(ring) {
+  const speedVariance = 1 + (Math.random() * 0.3 - 0.15);
+  const baseSpeed = 0.006 + ring * 0.002;
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  return {
+    ring,
+    angle: Math.random() * Math.PI * 2,
+    speed: baseSpeed * speedVariance * dir,
+    radius: 60 + ring * 50, // orbital radius
+    size: 9,
+    hue: 180 + ring * 35,
+    alive: true,
+    nearMissChecked: false
+  };
+}
+
+// --- MIRAGE ---
+function createMirage(isPhantom) {
+  // Lissajous-style drift
+  const cx = W * 0.25 + Math.random() * W * 0.5;
+  const cy = H * 0.25 + Math.random() * H * 0.5;
+  // drift direction
+  const angle = Math.random() * Math.PI * 2;
+  const speed = 0.35 + Math.random() * 0.25;
+  return {
+    x: cx, y: cy,
+    vx: Math.cos(angle) * speed,
+    vy: Math.sin(angle) * speed,
+    rx: 48, ry: 30, // ellipse radii (can shrink at high score)
+    hue: 180,
+    shimmerT: Math.random() * Math.PI * 2,
+    frozen: false,
+    freezeTimer: 0, // frames of freeze animation
+    cooldown: 0,    // frames after triggering
+    alive: true,
+    isPhantom: !!isPhantom,
+    phantomFreezeTimer: 0
+  };
+}
+
+// --- DIFFICULTY ---
+function getDifficulty() {
+  let numGems = 1;
+  let numMirages = 1;
+  let driftMult = 1;
+  let mirageShrink = 1;
+
+  if (score >= 100) { numGems = 3; numMirages = 2; driftMult = 1.6; mirageShrink = 0.75; }
+  else if (score >= 70) { numGems = 3; numMirages = 2; driftMult = 1.4; mirageShrink = 0.85; }
+  else if (score >= 45) { numGems = 3; numMirages = 2; driftMult = 1.3; }
+  else if (score >= 25) { numGems = 2; numMirages = 2; }
+  else if (score >= 10) { numGems = 2; numMirages = 1; }
+
+  return { numGems, numMirages, driftMult, mirageShrink };
+}
+
+// --- INIT/RESET ---
+function initGame() {
+  score = 0;
+  lives = 3;
+  heatStreak = 0;
+  heatMode = false;
+  heatTimer = 0;
+  bgHue = 250;
+  particles = [];
+  floatTexts = [];
+  shake = { x: 0, y: 0, frames: 0, mag: 0 };
+  gems = [];
+  mirages = [];
+  retryHold = 0;
+  triggeredMilestones = new Set();
+  milestoneFlash = { active: false, text: '', timer: 0 };
+  phantomMirage = null;
+  phantomFreezeTimer = 0;
+
+  gems.push(createGem(0));
+  mirages.push(createMirage(false));
+}
+
+// --- PARTICLES ---
+function spawnCollectParticles(x, y, hue) {
+  for (let i = 0; i < 12; i++) {
+    const angle = (i / 12) * Math.PI * 2 + Math.random() * 0.3;
+    const speed = 2.5 + Math.random() * 2.5;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 20, maxLife: 20,
+      r: 3 + Math.random() * 2,
+      hue, type: 'collect'
+    });
+  }
+}
+
+function spawnNearMissParticles(x, y) {
+  for (let i = 0; i < 8; i++) {
+    const angle = Math.PI * 0.1 + (i / 8) * Math.PI * 0.8 + Math.random() * 0.2;
+    const speed = 2 + Math.random() * 3;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 18, maxLife: 18,
+      r: 2.5 + Math.random() * 2,
+      hue: 20, type: 'nearmiss'
+    });
+  }
+}
+
+function spawnShardParticles(x, y) {
+  for (let i = 0; i < 6; i++) {
+    const angle = (i / 6) * Math.PI * 2;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * 3.5,
+      vy: Math.sin(angle) * 3.5,
+      life: 14, maxLife: 14,
+      r: 1.5, len: 12 + Math.random() * 8,
+      angle: angle,
+      hue: 190, type: 'shard'
+    });
+  }
+}
+
+function spawnHeatParticles(x, y, hue) {
+  for (let i = 0; i < 5; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * (1.5 + Math.random()),
+      vy: Math.sin(angle) * (1.5 + Math.random()),
+      life: 25, maxLife: 25,
+      r: 4, hue: 35, type: 'heat'
+    });
+  }
+}
+
+// --- FLOAT TEXTS ---
+function spawnFloatText(x, y, text, hue, big) {
+  floatTexts.push({ x, y, text, hue, big: !!big, life: 35, maxLife: 35, vy: -1.5 });
+}
+
+// --- SCREEN SHAKE ---
+function triggerShake(mag, frames) {
+  if (mag > shake.mag) { shake.mag = mag; shake.frames = frames; }
+}
+
+// --- FREEZE MIRAGE (player tap) ---
+function tryFreeze(px, py) {
+  if (state !== STATE.PLAYING) return;
+  if (phantomFreezeTimer > 0) return; // all mirages dark
+
+  // Find nearest active (not frozen, not on cooldown) mirage
+  let best = null, bestDist = Infinity;
+  for (const m of mirages) {
+    if (m.frozen || m.cooldown > 0 || !m.alive) continue;
+    const dx = px - m.x, dy = py - m.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist < bestDist) { bestDist = dist; best = m; }
+  }
+  // Check phantom mirage
+  if (phantomMirage && !phantomMirage.frozen && phantomMirage.cooldown <= 0) {
+    const dx = px - phantomMirage.x, dy = py - phantomMirage.y;
+    const dist = Math.sqrt(dx*dx+dy*dy);
+    if (dist < bestDist) { bestDist = dist; best = phantomMirage; }
+  }
+
+  if (!best) return;
+
+  if (best.isPhantom) {
+    // Tapping phantom = 2s freeze all real mirages
+    phantomFreezeTimer = 120;
+    triggerShake(3, 8);
+    spawnFloatText(best.x, best.y - 30, 'PHANTOM!', 0, false);
+    best.cooldown = 90;
+    return;
+  }
+
+  // Freeze it
+  best.frozen = true;
+  best.freezeTimer = 30;
+
+  // Check if a gem is inside
+  let caught = false;
+  for (const gem of gems) {
+    if (!gem.alive) continue;
+    const gx = W/2 + Math.cos(gem.angle) * gem.radius;
+    const gy = H/2 + Math.sin(gem.angle) * gem.radius;
+    // Ellipse containment test (normalized)
+    const dx = (gx - best.x) / (best.rx * (heatMode ? 1.15 : 1));
+    const dy = (gy - best.y) / (best.ry * (heatMode ? 1.15 : 1));
+    if (dx*dx + dy*dy <= 1.2) {
+      // Catch!
+      caught = true;
+      gem.alive = false;
+      score++;
+      heatStreak++;
+      if (heatStreak >= 3 && !heatMode) {
+        heatMode = true;
+        heatTimer = 180; // 3s at 60fps
+        spawnFloatText(W/2, H/2 - 60, 'HEAT MODE!', 35, true);
+        spawnHeatParticles(gx, gy, gem.hue);
+      }
+      spawnCollectParticles(gx, gy, gem.hue);
+
+      // PERFECT bonus (gem very centered)
+      const cdx = (gx - best.x) / best.rx;
+      const cdy = (gy - best.y) / best.ry;
+      const centerDist = Math.sqrt(cdx*cdx + cdy*cdy);
+      if (centerDist < 0.4) {
+        spawnFloatText(gx, gy - 20, 'PERFECT!', 55, false);
+        score++;
+      }
+
+      spawnFloatText(gx, gy - 40, '+' + (centerDist < 0.4 ? 2 : 1), gem.hue, false);
+      spawnShardParticles(gx, gy);
+
+      // Milestone check
+      for (const [threshold, msg] of Object.entries(MILESTONES)) {
+        if (score >= parseInt(threshold) && !triggeredMilestones.has(threshold)) {
+          triggeredMilestones.add(threshold);
+          milestoneFlash = { active: true, text: msg, timer: 90 };
+        }
+      }
+
+      best.cooldown = 50;
+      best.frozen = false;
+      best.freezeTimer = 0;
+      break;
+    }
+  }
+
+  if (!caught) {
+    // Wasted freeze — mirage cooldown 1.5s
+    best.cooldown = 90;
+    best.frozen = false;
+    best.freezeTimer = 0;
+    spawnFloatText(best.x, best.y - 20, 'MISS', 0, false);
+  }
+
+  // Adjust gem/mirage counts per difficulty
+  syncDifficulty();
+}
+
+// --- SYNC DIFFICULTY ---
+function syncDifficulty() {
+  const { numGems, numMirages, driftMult, mirageShrink } = getDifficulty();
+  while (gems.filter(g => g.alive).length < numGems) {
+    gems.push(createGem(gems.length % 4));
+  }
+  const activeMirages = mirages.filter(m => m.alive && !m.isPhantom);
+  while (activeMirages.length < numMirages) {
+    const m = createMirage(false);
+    m.vx *= driftMult;
+    m.vy *= driftMult;
+    m.rx *= mirageShrink || 1;
+    m.ry *= mirageShrink || 1;
+    mirages.push(m);
+    activeMirages.push(m);
+  }
+  // Phantom mirage at 100+
+  if (score >= 100 && !phantomMirage) {
+    phantomMirage = createMirage(true);
+  }
+}
+
+// --- UPDATE ---
+function update() {
+  if (state !== STATE.PLAYING) return;
+
+  // Background hue drift
+  bgHue += 0.02;
+  if (bgHue > 270) bgHue = 250;
+
+  // Screen shake
+  if (shake.frames > 0) {
+    shake.x = (Math.random() * 2 - 1) * shake.mag;
+    shake.y = (Math.random() * 2 - 1) * shake.mag;
+    shake.frames--;
+    if (shake.frames === 0) { shake.x = 0; shake.y = 0; shake.mag = 0; }
+  }
+
+  // Heat mode timer
+  if (heatMode) {
+    heatTimer--;
+    if (heatTimer <= 0) { heatMode = false; heatStreak = 0; }
+  }
+
+  // Phantom freeze timer
+  if (phantomFreezeTimer > 0) phantomFreezeTimer--;
+
+  // Milestone flash
+  if (milestoneFlash.active) {
+    milestoneFlash.timer--;
+    if (milestoneFlash.timer <= 0) milestoneFlash.active = false;
+  }
+
+  // Background specs
+  for (const s of bgSpecs) {
+    s.y -= s.vy;
+    if (s.y < -5) s.y = H + 5;
+  }
+
+  // Update gems
+  const { driftMult, mirageShrink } = getDifficulty();
+  for (const gem of gems) {
+    if (!gem.alive) continue;
+    gem.angle += gem.speed * (heatMode ? 0.85 : 1);
+  }
+
+  // Update mirages
+  const allMirages = [...mirages, ...(phantomMirage ? [phantomMirage] : [])];
+  for (const m of allMirages) {
+    if (!m.alive) continue;
+    if (m.cooldown > 0) { m.cooldown--; continue; }
+    if (m.freezeTimer > 0) { m.freezeTimer--; continue; }
+    m.x += m.vx;
+    m.y += m.vy;
+    m.shimmerT += 0.07;
+    // Bounce off walls with padding
+    const px = 60, py = 60;
+    if (m.x < px) { m.x = px; m.vx = Math.abs(m.vx); }
+    if (m.x > W - px) { m.x = W - px; m.vx = -Math.abs(m.vx); }
+    if (m.y < py) { m.y = py; m.vy = Math.abs(m.vy); }
+    if (m.y > H - py) { m.y = H - py; m.vy = -Math.abs(m.vy); }
+  }
+
+  // Check if gem passed through an unfrozen mirage (miss = life lost)
+  for (const m of mirages) {
+    if (!m.alive || m.isPhantom || m.frozen || m.cooldown > 0) continue;
+    for (const gem of gems) {
+      if (!gem.alive) continue;
+      const gx = W/2 + Math.cos(gem.angle) * gem.radius;
+      const gy = H/2 + Math.sin(gem.angle) * gem.radius;
+      const dx = (gx - m.x) / m.rx;
+      const dy = (gy - m.y) / m.ry;
+      const inside = dx*dx + dy*dy <= 1.0;
+
+      if (inside && !gem._inMirage) {
+        gem._inMirage = m;
+        gem.nearMissChecked = false;
+      } else if (!inside && gem._inMirage === m) {
+        // Gem just exited unfrozen mirage
+        gem._inMirage = null;
+        lives--;
+        heatStreak = 0;
+        heatMode = false;
+        spawnNearMissParticles(gx, gy);
+        triggerShake(4, 6);
+        spawnFloatText(gx, gy - 30, '-1 LIFE', 0, false);
+        if (lives <= 0) {
+          triggerGameOver();
+          return;
+        }
+      }
+    }
+  }
+
+  // Update particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.93;
+    p.vy *= 0.93;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+
+  // Update float texts
+  for (let i = floatTexts.length - 1; i >= 0; i--) {
+    const f = floatTexts[i];
+    f.y += f.vy;
+    f.life--;
+    if (f.life <= 0) floatTexts.splice(i, 1);
+  }
+
+  // Sync difficulty after update
+  syncDifficulty();
+}
+
+// --- GAME OVER ---
+function triggerGameOver() {
+  state = STATE.GAMEOVER;
+  saveBest(score);
+  saveDailyBest(score);
+  incSessionCount();
+  sessionCount = getSessionCount();
+  retryHold = 90; // 1.5s hold
+}
+
+// --- DRAW ---
+function draw() {
+  ctx.save();
+  ctx.translate(shake.x, shake.y);
+
+  // Background
+  const grad = ctx.createRadialGradient(W/2, H/2, 0, W/2, H/2, Math.max(W, H) * 0.75);
+  grad.addColorStop(0, `hsl(${bgHue}, 55%, 12%)`);
+  grad.addColorStop(1, `hsl(${bgHue - 25}, 65%, 5%)`);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Background specs
+  for (const s of bgSpecs) {
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${s.hue}, 80%, 70%, ${s.alpha})`;
+    ctx.fill();
+  }
+
+  if (state === STATE.PLAYING || state === STATE.GAMEOVER) {
+    drawOrbitalPaths();
+    drawMirages();
+    drawGems();
+    drawParticles();
+    drawFloatTexts();
+    drawHUD();
+    if (milestoneFlash.active) drawMilestoneFlash();
+    if (phantomFreezeTimer > 0) drawFreezeOverlay();
+    if (heatMode) drawHeatOverlay();
+  }
+
+  if (state === STATE.START) drawStartScreen();
+  if (state === STATE.GAMEOVER) drawGameOver();
+
+  ctx.restore();
+}
+
+function drawOrbitalPaths() {
+  ctx.save();
+  const { numGems } = getDifficulty();
+  for (let i = 0; i < Math.max(numGems, gems.filter(g=>g.alive).length); i++) {
+    const r = 60 + i * 50;
+    ctx.beginPath();
+    ctx.arc(W/2, H/2, r, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(150,180,255,0.10)';
+    ctx.setLineDash([4, 8]);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.restore();
+}
+
+function drawMirages() {
+  const allMirages = [...mirages, ...(phantomMirage ? [phantomMirage] : [])];
+  for (const m of allMirages) {
+    if (!m.alive) continue;
+    const dark = (m.isPhantom ? false : phantomFreezeTimer > 0);
+    const shimmerAlpha = dark ? 0.08 : (0.15 + Math.sin(m.shimmerT * 2) * 0.15 + 0.08);
+    const hue = m.isPhantom ? 300 : (heatMode ? 35 : (m.cooldown > 0 ? 190 : 180 + Math.sin(m.shimmerT) * 20));
+
+    if (m.cooldown > 0 && !m.isPhantom) {
+      // Cooldown ripple
+      const t = m.cooldown / 90;
+      ctx.beginPath();
+      ctx.ellipse(m.x, m.y, m.rx * (1 + (1-t)*0.4), m.ry * (1 + (1-t)*0.4), 0, 0, Math.PI*2);
+      ctx.strokeStyle = `hsla(${hue}, 80%, 65%, ${t * 0.4})`;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      continue;
+    }
+
+    ctx.save();
+    // Outer ellipse
+    ctx.beginPath();
+    ctx.ellipse(m.x, m.y, m.rx, m.ry, 0, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${hue}, 85%, 65%, ${shimmerAlpha})`;
+    ctx.fill();
+    ctx.strokeStyle = `hsla(${hue}, 90%, 75%, ${shimmerAlpha + 0.15})`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Inner ellipse (offset 4px)
+    ctx.beginPath();
+    ctx.ellipse(m.x + 4, m.y + 2, m.rx * 0.65, m.ry * 0.65, 0, 0, Math.PI * 2);
+    ctx.fillStyle = `hsla(${hue + 15}, 90%, 75%, ${shimmerAlpha * 0.7})`;
+    ctx.fill();
+
+    // Freeze animation
+    if (m.freezeTimer > 0) {
+      const t = m.freezeTimer / 30;
+      ctx.beginPath();
+      ctx.ellipse(m.x, m.y, m.rx, m.ry, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = `hsla(${hue}, 90%, 90%, ${t})`;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+}
+
+function drawGems() {
+  for (const gem of gems) {
+    if (!gem.alive) continue;
+    const gx = W/2 + Math.cos(gem.angle) * gem.radius;
+    const gy = H/2 + Math.sin(gem.angle) * gem.radius;
+    const baseSize = gem.size;
+    const size = heatMode ? baseSize * 1.6 : baseSize;
+
+    // Outer glow
+    const glowR = ctx.createRadialGradient(gx, gy, 0, gx, gy, size * 2.5);
+    glowR.addColorStop(0, `hsla(${gem.hue}, 90%, 75%, 0.45)`);
+    glowR.addColorStop(1, `hsla(${gem.hue}, 90%, 60%, 0)`);
+    ctx.beginPath();
+    ctx.arc(gx, gy, size * 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = glowR;
+    ctx.fill();
+
+    // Gem body (radial gradient: dark center → bright rim)
+    const gemG = ctx.createRadialGradient(gx - size*0.25, gy - size*0.25, size*0.1, gx, gy, size);
+    gemG.addColorStop(0, `hsl(${gem.hue + 30}, 60%, 90%)`);
+    gemG.addColorStop(0.5, `hsl(${gem.hue}, 85%, 65%)`);
+    gemG.addColorStop(1, `hsl(${gem.hue - 20}, 70%, 40%)`);
+    ctx.beginPath();
+    ctx.arc(gx, gy, size, 0, Math.PI * 2);
+    ctx.fillStyle = gemG;
+    ctx.fill();
+
+    // Heat mode pulse ring
+    if (heatMode) {
+      ctx.beginPath();
+      ctx.arc(gx, gy, size * 2, 0, Math.PI * 2);
+      ctx.strokeStyle = `hsla(35, 100%, 65%, 0.35)`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const t = p.life / p.maxLife;
+    if (p.type === 'shard') {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.angle);
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(p.len * t, 0);
+      ctx.strokeStyle = `hsla(${p.hue}, 80%, 70%, ${t})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.restore();
+    } else {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r * t, 0, Math.PI * 2);
+      const alpha = t * (p.type === 'heat' ? 0.7 : 0.9);
+      ctx.fillStyle = `hsla(${p.hue}, 85%, 65%, ${alpha})`;
+      ctx.fill();
+    }
+  }
+}
+
+function drawFloatTexts() {
+  for (const f of floatTexts) {
+    const t = f.life / f.maxLife;
+    const scaleT = f.big ? (1.0 + (1 - t) * 0.4) : 1.0;
+    ctx.save();
+    ctx.globalAlpha = Math.min(t * 2, 1);
+    ctx.font = `bold ${f.big ? Math.round(22 * scaleT) : 14}px 'Segoe UI', system-ui, sans-serif`;
+    ctx.fillStyle = f.hue === 0 ? '#ff5555' : `hsl(${f.hue}, 85%, 70%)`;
+    ctx.textAlign = 'center';
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.restore();
+  }
+}
+
+function drawHUD() {
+  // Score
+  ctx.save();
+  ctx.font = 'bold 28px system-ui';
+  ctx.fillStyle = 'rgba(255,255,255,0.92)';
+  ctx.textAlign = 'center';
+  ctx.fillText(score, W/2, 38);
+
+  // Lives (dots)
+  const dotR = 7, dotY = 60, dotSpacing = 22;
+  const dotsStart = W/2 - (3 - 1) * dotSpacing / 2;
+  for (let i = 0; i < 3; i++) {
+    ctx.beginPath();
+    ctx.arc(dotsStart + i * dotSpacing, dotY, dotR, 0, Math.PI * 2);
+    if (i < lives) {
+      ctx.fillStyle = i < lives ? 'hsl(180, 80%, 65%)' : 'rgba(255,255,255,0.15)';
+      ctx.fill();
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  // Heat mode bar
+  if (heatMode) {
+    ctx.font = 'bold 12px system-ui';
+    ctx.fillStyle = 'hsl(35, 100%, 65%)';
+    ctx.textAlign = 'center';
+    ctx.fillText('🔥 HEAT MODE', W/2, H - 22);
+  } else if (heatStreak > 0) {
+    ctx.font = '12px system-ui';
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.textAlign = 'center';
+    ctx.fillText(`streak: ${heatStreak}/3`, W/2, H - 22);
+  }
+
+  // Challenge target
+  if (CHALLENGE_TARGET > 0 && score < CHALLENGE_TARGET) {
+    ctx.font = '11px system-ui';
+    ctx.fillStyle = 'rgba(255,180,100,0.7)';
+    ctx.textAlign = 'right';
+    ctx.fillText(`BEAT: ${CHALLENGE_TARGET}`, W - 14, 38);
+  }
+
+  ctx.restore();
+}
+
+function drawMilestoneFlash() {
+  const t = milestoneFlash.timer / 90;
+  ctx.save();
+  ctx.globalAlpha = Math.min(t * 3, 1) * Math.min((1 - t) * 3, 1);
+  ctx.font = 'bold 32px system-ui';
+  ctx.fillStyle = `hsl(180, 90%, 70%)`;
+  ctx.textAlign = 'center';
+  ctx.fillText(milestoneFlash.text, W/2, H/2);
+  ctx.restore();
+}
+
+function drawFreezeOverlay() {
+  const t = phantomFreezeTimer / 120;
+  ctx.save();
+  ctx.globalAlpha = t * 0.15;
+  ctx.fillStyle = '#000030';
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = 1;
+  ctx.font = 'bold 14px system-ui';
+  ctx.fillStyle = `rgba(180,100,255,${t})`;
+  ctx.textAlign = 'center';
+  ctx.fillText('PHANTOM FREEZE — MIRAGES DARK', W/2, H/2 + 100);
+  ctx.restore();
+}
+
+function drawHeatOverlay() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.globalAlpha = 0.08;
+  ctx.fillStyle = 'hsl(35, 100%, 65%)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function drawStartScreen() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.font = 'bold 38px system-ui';
+  ctx.fillStyle = 'hsl(180, 90%, 72%)';
+  ctx.textAlign = 'center';
+  ctx.fillText('MIRAGE LOCK', W/2, H/2 - 80);
+
+  ctx.font = '15px system-ui';
+  ctx.fillStyle = 'rgba(200,220,255,0.75)';
+  ctx.fillText('Gems orbit the center.', W/2, H/2 - 35);
+  ctx.fillText('Tap when a gem is inside a shimmer.', W/2, H/2 - 12);
+  ctx.fillText('Miss = lose a life. 3 lives total.', W/2, H/2 + 12);
+
+  // Tap to start
+  const pulse = 0.75 + Math.sin(Date.now() / 400) * 0.25;
+  ctx.globalAlpha = pulse;
+  ctx.font = 'bold 18px system-ui';
+  ctx.fillStyle = 'hsl(180, 85%, 70%)';
+  ctx.fillText('TAP TO START', W/2, H/2 + 70);
+  ctx.globalAlpha = 1;
+
+  if (getBest() > 0) {
+    ctx.font = '13px system-ui';
+    ctx.fillStyle = 'rgba(180,200,255,0.5)';
+    ctx.fillText(`Best: ${getBest()} gems`, W/2, H/2 + 100);
+  }
+
+  if (CHALLENGE_TARGET > 0) {
+    ctx.font = 'bold 13px system-ui';
+    ctx.fillStyle = 'hsl(35, 90%, 65%)';
+    ctx.fillText(`CHALLENGE: Beat ${CHALLENGE_TARGET} gems`, W/2, H/2 + 125);
+  }
+
+  ctx.restore();
+}
+
+function drawGameOver() {
+  if (retryHold > 0) return; // still in hold period
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Score (scale-in)
+  ctx.font = 'bold 56px system-ui';
+  ctx.fillStyle = 'hsl(180, 90%, 72%)';
+  ctx.textAlign = 'center';
+  ctx.fillText(score, W/2, H/2 - 60);
+
+  ctx.font = 'bold 16px system-ui';
+  ctx.fillStyle = 'rgba(200,220,255,0.8)';
+  ctx.fillText('GEMS CAUGHT', W/2, H/2 - 28);
+
+  // Best delta
+  const best = getBest();
+  const daily = getDailyBest();
+  if (score >= best) {
+    ctx.font = 'bold 14px system-ui';
+    ctx.fillStyle = 'hsl(180, 85%, 65%)';
+    ctx.fillText('NEW BEST!', W/2, H/2 + 5);
+  } else {
+    ctx.font = '13px system-ui';
+    ctx.fillStyle = 'rgba(160,180,220,0.65)';
+    ctx.fillText(`Best: ${best}  Daily: ${daily}`, W/2, H/2 + 5);
+  }
+
+  // Heat streak
+  if (heatStreak > 0 || heatMode) {
+    ctx.font = '12px system-ui';
+    ctx.fillStyle = 'hsl(35, 90%, 65%)';
+    ctx.fillText(`Max streak: ${Math.max(heatStreak, 3)} gems`, W/2, H/2 + 26);
+  }
+
+  // Session count persistence message
+  if (sessionCount >= 10) {
+    ctx.font = '12px system-ui';
+    ctx.fillStyle = 'rgba(200,200,255,0.45)';
+    ctx.fillText(`Still going? Your streak: ${sessionCount} runs`, W/2, H/2 + 48);
+  }
+
+  // PLAY AGAIN
+  const btnW = 180, btnH = 48, btnX = W/2 - btnW/2, btnY = H/2 + 75;
+  ctx.beginPath();
+  ctx.roundRect(btnX, btnY, btnW, btnH, 12);
+  ctx.fillStyle = 'hsl(180, 70%, 28%)';
+  ctx.fill();
+  ctx.strokeStyle = 'hsl(180, 80%, 55%)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.font = 'bold 17px system-ui';
+  ctx.fillStyle = 'hsl(180, 90%, 80%)';
+  ctx.fillText('TAP TO RETRY', W/2, btnY + 30);
+
+  // Share button
+  const sBtnY = btnY + 62;
+  ctx.beginPath();
+  ctx.roundRect(W/2 - 90, sBtnY, 180, 38, 10);
+  ctx.fillStyle = 'rgba(255,255,255,0.07)';
+  ctx.fill();
+  ctx.font = '13px system-ui';
+  ctx.fillStyle = 'rgba(180,200,255,0.65)';
+  ctx.fillText('SHARE SCORE', W/2, sBtnY + 24);
+
+  ctx.restore();
+}
+
+// --- LOOP ---
+let lastTime = 0;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = ts - lastTime;
+  lastTime = ts;
+
+  if (state === STATE.GAMEOVER && retryHold > 0) {
+    retryHold--;
+  }
+
+  update();
+  draw();
+}
+
+// --- INPUT ---
+function getCanvasPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = W / rect.width;
+  const scaleY = H / rect.height;
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY
+  };
+}
+
+function handleTap(e) {
+  e.preventDefault();
+  const pos = getCanvasPos(e);
+
+  if (state === STATE.START) {
+    state = STATE.PLAYING;
+    initGame();
+    return;
+  }
+
+  if (state === STATE.GAMEOVER && retryHold <= 0) {
+    // Check share button hit
+    const btnY = H/2 + 75 + 62;
+    if (pos.y >= btnY && pos.y <= btnY + 38 && pos.x >= W/2 - 90 && pos.x <= W/2 + 90) {
+      shareScore();
+      return;
+    }
+    // Retry
+    state = STATE.PLAYING;
+    initGame();
+    return;
+  }
+
+  if (state === STATE.PLAYING) {
+    tryFreeze(pos.x, pos.y);
+  }
+}
+
+canvas.addEventListener('pointerdown', handleTap);
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    if (state === STATE.START) { state = STATE.PLAYING; initGame(); return; }
+    if (state === STATE.GAMEOVER && retryHold <= 0) { state = STATE.PLAYING; initGame(); return; }
+    if (state === STATE.PLAYING) tryFreeze(W/2, H/2); // center tap fallback
+  }
+});
+
+// --- SHARE ---
+function shareScore() {
+  const text = `I locked ${score} gems in MIRAGE LOCK 🔮\nCan you beat it?`;
+  const url = `https://balinti.github.io/mirage-lock/?target=${score}`;
+  if (navigator.share) {
+    navigator.share({ title: 'Mirage Lock', text, url }).catch(() => {});
+  } else {
+    navigator.clipboard.writeText(`${text}\n${url}`).then(() => {
+      spawnFloatText(W/2, H/2, 'COPIED!', 180, false);
+    }).catch(() => {});
+  }
+}
+
+// --- START ---
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
